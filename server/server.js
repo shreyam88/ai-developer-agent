@@ -149,6 +149,241 @@ async function callOllama(
 }
 
 /* =========================
+   SMOOTH STREAMING
+========================= */
+
+async function streamOllamaResponse(
+  ollamaResponse,
+  res
+) {
+  const reader =
+    ollamaResponse.body.getReader();
+
+  const decoder =
+    new TextDecoder();
+
+  let buffer = "";
+  let fullResponse = "";
+
+  let pendingText = "";
+  let flushTimer = null;
+
+  const flushPending = () => {
+    if (!pendingText) {
+      return;
+    }
+
+    res.write(pendingText);
+    pendingText = "";
+  };
+
+  const scheduleFlush = () => {
+    if (flushTimer !== null) {
+      return;
+    }
+
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      flushPending();
+    }, 50);
+  };
+
+  while (true) {
+    const {
+      done,
+      value,
+    } = await reader.read();
+
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(
+      value,
+      {
+        stream: true,
+      }
+    );
+
+    const lines =
+      buffer.split("\n");
+
+    buffer =
+      lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.trim()) {
+        continue;
+      }
+
+      try {
+        const data =
+          JSON.parse(line);
+
+        if (data.response) {
+          fullResponse +=
+            data.response;
+
+          pendingText +=
+            data.response;
+
+          scheduleFlush();
+        }
+      } catch (error) {
+        console.log(
+          "⚠️ JSON chunk skipped:",
+          error.message
+        );
+      }
+    }
+  }
+
+  /* =========================
+     FINAL BUFFER
+  ========================= */
+
+  if (buffer.trim()) {
+    try {
+      const data =
+        JSON.parse(buffer);
+
+      if (data.response) {
+        fullResponse +=
+          data.response;
+
+        pendingText +=
+          data.response;
+      }
+    } catch (error) {
+      console.log(
+        "⚠️ Final JSON warning:",
+        error.message
+      );
+    }
+  }
+
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+
+  flushPending();
+
+  return fullResponse;
+}
+
+/* =========================
+   STREAM RESPONSE HEADERS
+========================= */
+
+function setupStreamingResponse(res) {
+  res.status(200);
+
+  res.setHeader(
+    "Content-Type",
+    "text/plain; charset=utf-8"
+  );
+
+  res.setHeader(
+    "Cache-Control",
+    "no-cache, no-transform"
+  );
+
+  res.setHeader(
+    "X-Accel-Buffering",
+    "no"
+  );
+
+  res.setHeader(
+    "Connection",
+    "keep-alive"
+  );
+
+  if (
+    typeof res.flushHeaders ===
+    "function"
+  ) {
+    res.flushHeaders();
+  }
+}
+
+/* =========================
+   RESPONSE LENGTH RULE
+========================= */
+
+function getResponseStyle(message) {
+  const text =
+    message.toLowerCase();
+
+  const detailedWords = [
+    "detail",
+    "detailed",
+    "in detail",
+    "deeply",
+    "deep explanation",
+    "thorough",
+    "elaborate",
+    "step by step",
+    "step-by-step",
+    "full explanation",
+    "complete explanation",
+  ];
+
+  const briefWords = [
+    "brief",
+    "briefly",
+    "short",
+    "in short",
+    "short answer",
+    "one line",
+    "one sentence",
+  ];
+
+  if (
+    detailedWords.some((word) =>
+      text.includes(word)
+    )
+  ) {
+    return `
+RESPONSE LENGTH:
+The user explicitly wants a detailed answer.
+
+- Give a detailed and clear explanation.
+- Include important examples when useful.
+- Explain concepts step by step when appropriate.
+- Do not omit important information.
+`;
+  }
+
+  if (
+    briefWords.some((word) =>
+      text.includes(word)
+    )
+  ) {
+    return `
+RESPONSE LENGTH:
+The user explicitly wants a brief answer.
+
+- Keep the answer very short.
+- Give only the essential information.
+- Prefer 1-4 short points or a few sentences.
+- Do not add unnecessary examples.
+`;
+  }
+
+  return `
+RESPONSE LENGTH:
+The user did not ask for a detailed explanation.
+
+- Give a concise and useful answer.
+- Normally use 2-6 short paragraphs or bullet points.
+- Explain only what is necessary.
+- Do not unnecessarily expand the answer.
+- If an example is useful, keep it small.
+`;
+}
+
+/* =========================
    HOME
 ========================= */
 
@@ -163,26 +398,29 @@ app.get("/", (req, res) => {
    FILE LIST
 ========================= */
 
-app.get("/api/files", (req, res) => {
-  try {
-    const files =
-      fs.readdirSync(srcPath);
+app.get(
+  "/api/files",
+  (req, res) => {
+    try {
+      const files =
+        fs.readdirSync(srcPath);
 
-    res.json({
-      files,
-    });
-  } catch (error) {
-    console.error(
-      "❌ Files Error:",
-      error
-    );
+      res.json({
+        files,
+      });
+    } catch (error) {
+      console.error(
+        "❌ Files Error:",
+        error
+      );
 
-    res.status(500).json({
-      error:
-        "Files read nahi ho pa rahi hain.",
-    });
+      res.status(500).json({
+        error:
+          "Files read nahi ho pa rahi hain.",
+      });
+    }
   }
-});
+);
 
 /* =========================
    READ FILE
@@ -361,16 +599,27 @@ app.put(
     }
   }
 );
-app.post("/api/chat/clear", (req, res) => {
-  chatHistory.length = 0;
 
-  console.log("🗑️ Chat history cleared.");
+/* =========================
+   CLEAR CHAT
+========================= */
 
-  res.json({
-    success: true,
-    message: "Chat history clear ho gayi.",
-  });
-});
+app.post(
+  "/api/chat/clear",
+  (req, res) => {
+    chatHistory.length = 0;
+
+    console.log(
+      "🗑️ Chat history cleared."
+    );
+
+    res.json({
+      success: true,
+      message:
+        "Chat history clear ho gayi.",
+    });
+  }
+);
 
 /* =========================
    CHAT
@@ -411,7 +660,7 @@ app.post(
         message.toLowerCase();
 
       /* =========================
-         READ FILE
+         READ / EXPLAIN FILE
       ========================= */
 
       const readMatch =
@@ -469,21 +718,36 @@ RULES:
 - Explain ONLY the code that actually exists.
 - Do not invent functionality.
 - Do not claim something exists if it does not.
-- Keep the explanation beginner friendly.
+- Focus on the main responsibilities of the file.
+- Do not explain every line unless the user asks for it.
+- Do not repeat the complete code.
+- Use simple language.
+- Use short bullet points where useful.
+
+${getResponseStyle(message)}
 `;
+
+        setupStreamingResponse(res);
+
+        console.log(
+          "📖 Streaming file explanation..."
+        );
 
         const ollamaResponse =
           await callOllama(
             prompt,
-            false
+            true
           );
 
-        const data =
-          await ollamaResponse.json();
+        console.log(
+          "✅ Ollama file explanation stream connected."
+        );
 
         const reply =
-          data.response ||
-          "File explanation nahi mili.";
+          await streamOllamaResponse(
+            ollamaResponse,
+            res
+          );
 
         addToHistory(
           "user",
@@ -495,9 +759,13 @@ RULES:
           reply
         );
 
-        return res.json({
-          reply,
-        });
+        res.end();
+
+        console.log(
+          "✅ File explanation streaming completed."
+        );
+
+        return;
       }
 
       /* =========================
@@ -981,12 +1249,6 @@ STRICT RULES:
         "🤖 Normal AI streaming request..."
       );
 
-      /*
-        Current message ko history mein
-        add karne se pehle old history
-        capture kar rahe hain.
-      */
-
       const previousHistory =
         getHistoryText();
 
@@ -1012,16 +1274,17 @@ Instructions:
 - If the user refers to something discussed earlier,
   use the conversation context.
 - Be helpful and beginner friendly.
-`;
+- Do not unnecessarily make the answer long.
 
-      /*
-        User message history mein save karo.
-      */
+${getResponseStyle(message)}
+`;
 
       addToHistory(
         "user",
         message
       );
+
+      setupStreamingResponse(res);
 
       const ollamaResponse =
         await callOllama(
@@ -1033,122 +1296,11 @@ Instructions:
         "✅ Ollama stream connected."
       );
 
-      res.status(200);
-
-      res.setHeader(
-        "Content-Type",
-        "text/plain; charset=utf-8"
-      );
-
-      res.setHeader(
-        "Cache-Control",
-        "no-cache, no-transform"
-      );
-
-      res.setHeader(
-        "X-Accel-Buffering",
-        "no"
-      );
-
-      const reader =
-        ollamaResponse.body.getReader();
-
-      const decoder =
-        new TextDecoder();
-
-      let buffer = "";
-      let fullResponse = "";
-
-      while (true) {
-        const {
-          done,
-          value,
-        } = await reader.read();
-
-        if (done) {
-          break;
-        }
-
-        buffer +=
-          decoder.decode(
-            value,
-            {
-              stream: true,
-            }
-          );
-
-        const lines =
-          buffer.split("\n");
-
-        buffer =
-          lines.pop() || "";
-
-        for (
-          const line of lines
-        ) {
-          if (
-            !line.trim()
-          ) {
-            continue;
-          }
-
-          try {
-            const data =
-              JSON.parse(line);
-
-            if (
-              data.response
-            ) {
-              fullResponse +=
-                data.response;
-
-              res.write(
-                data.response
-              );
-            }
-          } catch (error) {
-            console.log(
-              "⚠️ JSON chunk skipped:",
-              error.message
-            );
-          }
-        }
-      }
-
-      /* =========================
-         FINAL BUFFER
-      ========================= */
-
-      if (
-        buffer.trim()
-      ) {
-        try {
-          const data =
-            JSON.parse(
-              buffer
-            );
-
-          if (
-            data.response
-          ) {
-            fullResponse +=
-              data.response;
-
-            res.write(
-              data.response
-            );
-          }
-        } catch (error) {
-          console.log(
-            "⚠️ Final JSON warning:",
-            error.message
-          );
-        }
-      }
-
-      /*
-        Assistant response history mein save.
-      */
+      const fullResponse =
+        await streamOllamaResponse(
+          ollamaResponse,
+          res
+        );
 
       addToHistory(
         "assistant",
